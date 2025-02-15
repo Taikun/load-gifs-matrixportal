@@ -1,18 +1,15 @@
-// Play GIFs from CIRCUITPY drive (USB-accessible filesystem) to LED matrix.
-// ***DESIGNED FOR ADAFRUIT MATRIXPORTAL***, but may run on some other M4,
-// M0, ESP32S3 and nRF52 boards (relies on TinyUSB stack). As written, runs
-// on 64x32 pixel matrix, this can be changed by editing the WIDTH and HEIGHT
-// definitions. See the "simple" example for a run-down on matrix config.
-// Adapted from examples from Larry Bank's AnimatedGIF library and
-// msc_external_flash example in Adafruit_TinyUSB_Arduino.
-// Prerequisite libraries:
-//   - Adafruit_Protomatter
-//   - Adafruit_SPIFlash
-//   - Adafruit_TinyUSB
-//   - SdFat (Adafruit fork)
-//   - AnimatedGIF
-// Set ENABLE_EXTENDED_TRANSFER_CLASS and FAT12_SUPPORT in SdFatConfig.h.
-// Select Tools->USB Stack->TinyUSB before compiling.
+/*********************************************************************
+  EJEMPLO FLEXIBLE PARA MOSTRAR GIFS EN UNA MATRIZ RGB CON ADAFRUIT
+  MATRIXPORTAL, USANDO UNA ESTRUCTURA MÁS MODULAR Y CONTROL NO BLOQUEANTE.
+  
+  - Se escanea la carpeta /gifs y se almacena la lista en un vector.
+  - Se reproduce cada GIF cuatro ciclos, luego pasa al siguiente.
+  - Tras el último GIF, se muestra la animación "Compu LAB" estilo Pipboy.
+  - Uso de control de frames con millis() en vez de delay() para no
+    bloquear el loop y permitir manejo de botones u otras tareas.
+*********************************************************************/
+
+#define _VARIANT_MATRIXPORTAL_M4_  // Forzar configuración si es necesario
 
 #include <Adafruit_Protomatter.h>
 #include <Adafruit_SPIFlash.h>
@@ -20,353 +17,363 @@
 #include <AnimatedGIF.h>
 #include <SPI.h>
 #include <SdFat.h>
+#include <vector>
 #include <cassert>
 
-// CONFIGURABLE SETTINGS ---------------------------------------------------
+// =================== CONFIGURACIÓN BÁSICA ===================
+#define WIDTH  64
+#define HEIGHT 64
+const char *GIF_DIR = "/gifs"; // Carpeta donde buscar los GIF
 
-char GIFpath[] = "/gifs";     // Absolute path to GIFs on CIRCUITPY drive
-uint16_t GIFminimumTime = 60; // Min. repeat time (seconds) until next GIF
-#define WIDTH  64             // Matrix width in pixels
-#define HEIGHT 64             // Matrix height in pixels
-// Maximim matrix height is 32px on most boards, 64 on MatrixPortal if the
-// 'E' jumper is set.
+// Cuántos ciclos (repeticiones) de cada GIF antes de pasar al siguiente
+#define GIF_CYCLES 4
 
-// FLASH FILESYSTEM STUFF --------------------------------------------------
-
-// unsigned long previousMillis = 0;        // Almacenará la última vez que se actualizó el evento.
-// const long interval = 5000;              // Intervalo deseado de 5 segundos.
-
-
-// External flash macros for QSPI or SPI are defined in board variant file.
+// ---------------- FLASH / FILESYSTEM ----------------
 #if defined(ARDUINO_ARCH_ESP32)
-static Adafruit_FlashTransport_ESP32 flashTransport;
+  static Adafruit_FlashTransport_ESP32 flashTransport;
 #elif defined(EXTERNAL_FLASH_USE_QSPI)
-Adafruit_FlashTransport_QSPI flashTransport;
+  Adafruit_FlashTransport_QSPI flashTransport;
 #elif defined(EXTERNAL_FLASH_USE_SPI)
-Adafruit_FlashTransport_SPI flashTransport(EXTERNAL_FLASH_USE_CS,
-                                           EXTERNAL_FLASH_USE_SPI);
+  Adafruit_FlashTransport_SPI flashTransport(EXTERNAL_FLASH_USE_CS,
+                                             EXTERNAL_FLASH_USE_SPI);
 #else
-#error No QSPI/SPI flash are defined in your board variant.h!
+  #error No QSPI/SPI flash are defined in your board variant.h!
 #endif
 
 Adafruit_SPIFlash flash(&flashTransport);
-FatFileSystem filesys;     // Filesystem object from SdFat
-Adafruit_USBD_MSC usb_msc; // USB mass storage object
+FatFileSystem      filesys;
+Adafruit_USBD_MSC  usb_msc;
+static bool        msc_changed = true; // Para detectar cambios en el FS
 
-// RGB MATRIX (PROTOMATTER) LIBRARY STUFF ----------------------------------
-
+// ---------------- PROTOMATTER (MATRIZ) ----------------
 #if defined(_VARIANT_MATRIXPORTAL_M4_)
-uint8_t rgbPins[] = {7, 8, 9, 10, 11, 12};
-uint8_t addrPins[] = {17, 18, 19, 20, 21}; // 16/32/64 pixels tall
-uint8_t clockPin = 14;
-uint8_t latchPin = 15;
-uint8_t oePin = 16;
-#define BACK_BUTTON 2
-#define NEXT_BUTTON 3
+  uint8_t rgbPins[]  = {7, 8, 9, 10, 11, 12};
+  uint8_t addrPins[] = {17, 18, 19, 20, 21};
+  uint8_t clockPin   = 14;
+  uint8_t latchPin   = 15;
+  uint8_t oePin      = 16;
+  #define BACK_BUTTON 2
+  #define NEXT_BUTTON 3
 #elif defined(ARDUINO_ADAFRUIT_MATRIXPORTAL_ESP32S3)
-uint8_t rgbPins[] = {42, 41, 40, 38, 39, 37};
-uint8_t addrPins[] = {45, 36, 48, 35, 21}; // 16/32/64 pixels tall
-uint8_t clockPin = 2;
-uint8_t latchPin = 47;
-uint8_t oePin = 14;
-#define BACK_BUTTON 6
-#define NEXT_BUTTON 7
-#elif defined(_VARIANT_METRO_M4_)
-uint8_t rgbPins[] = {2, 3, 4, 5, 6, 7};
-uint8_t addrPins[] = {A0, A1, A2, A3}; // 16 or 32 pixels tall
-uint8_t clockPin = A4;
-uint8_t latchPin = 10;
-uint8_t oePin = 9;
-#elif defined(_VARIANT_FEATHER_M4_)
-uint8_t rgbPins[] = {6, 5, 9, 11, 10, 12};
-uint8_t addrPins[] = {A5, A4, A3, A2}; // 16 or 32 pixels tall
-uint8_t clockPin = 13;
-uint8_t latchPin = 0;
-uint8_t oePin = 1;
+  uint8_t rgbPins[]  = {42, 41, 40, 38, 39, 37};
+  uint8_t addrPins[] = {45, 36, 48, 35, 21};
+  uint8_t clockPin   = 2;
+  uint8_t latchPin   = 47;
+  uint8_t oePin      = 14;
+  #define BACK_BUTTON 6
+  #define NEXT_BUTTON 7
 #endif
+
 #if HEIGHT == 16
-#define NUM_ADDR_PINS 3
+  #define NUM_ADDR_PINS 3
 #elif HEIGHT == 32
-#define NUM_ADDR_PINS 4
+  #define NUM_ADDR_PINS 4
 #elif HEIGHT == 64
-#define NUM_ADDR_PINS 5
+  #define NUM_ADDR_PINS 5
 #endif
 
-Adafruit_Protomatter matrix(WIDTH, 6, 1, rgbPins, NUM_ADDR_PINS, addrPins,
-                            clockPin, latchPin, oePin, true);
+Adafruit_Protomatter matrix(
+  WIDTH, 6, 1, rgbPins, NUM_ADDR_PINS, addrPins,
+  clockPin, latchPin, oePin, true);
 
-// ANIMATEDGIF LIBRARY STUFF -----------------------------------------------
+// --------------- ESTRUCTURAS / CLASES MODULARES ---------------
 
-AnimatedGIF GIF;
-File GIFfile;
-int16_t xPos = 0, yPos = 0; // Top-left pixel coord of GIF in matrix space
+// ---------- 1) FileManager: escanea y guarda lista de GIFs ----
+std::vector<String> gifList;  // Única declaración del vector
 
-// FILE ACCESS FUNCTIONS REQUIRED BY ANIMATED GIF LIB ----------------------
-
-/**
- * @brief Open GIF file
- *
- * Opens the specified GIF file, located at the given path, and returns
- * a pointer to the file's File object if successful. If there was an error
- * opening the file, NULL is returned.
- *
- * The function also stores the file's size in the output parameter @p pSize.
- *
- * @param filename Absolute path of GIF file to open
- * @param pSize    Output parameter where the file size is stored
- *
- * @return Pointer to File object if successful, or NULL if error
- */
-void *GIFOpenFile(const char *filename, int32_t *pSize) {
-  Serial.print("Opening GIF file: ");
-  Serial.println(filename);
-  GIFfile = filesys.open(filename);
-  if (!GIFfile) { // If unable to open file...
-    Serial.print("Error opening GIF file: ");
-    Serial.println(filename);
-    return NULL; // Return NULL to indicate error
+void scanGifs(const char *path, std::vector<String> &list) {
+  list.clear();
+  File dir = filesys.open(path);
+  if (!dir) {
+    Serial.println("No se pudo abrir el directorio de GIFs.");
+    return;
   }
-  *pSize = GIFfile.size(); // Get file size
-  Serial.print("File size: ");
-  Serial.println(*pSize);
-  return (void *)&GIFfile; // Return pointer to File object
-}
-
-/**
- * @brief Close GIF file
- *
- * Closes the specified GIF file, which was previously opened via
- * GIFOpenFile(). This function is called by the AnimatedGIF library
- * when it's done with a GIF file.
- *
- * @param pHandle Pointer to File object to close
- */
-void GIFCloseFile(void *pHandle) {
-  File *f = static_cast<File *>(pHandle);
-  if (f) {
-    Serial.print("Closing GIF file, f = ");
-    Serial.println((int)f);
-  }
-  if (f) f->close(); // Close the file if it's open
-}
-
-/**
- * @brief Read from GIF file
- *
- * Reads up to @p iLen bytes from the current position in the GIF file
- * @p pFile and writes them to @p pBuf. Returns the number of bytes
- * actually read, which may be less than @p iLen if the end of the file
- * was reached.
- *
- * The function also updates @p pFile->iPos to reflect the new position
- * in the file, just like fseek() in C.
- *
- * @param pFile Pointer to GIF file object
- * @param pBuf  Pointer to destination buffer
- * @param iLen  Maximum number of bytes to read
- *
- * @return Number of bytes actually read
- */
-int32_t GIFReadFile(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen) {
-  int32_t iBytesRead = iLen; // Number of bytes read from file
-  File *f = static_cast<File *>(pFile->fHandle);
-  // If trying to read past end of file, read up to last byte instead
-  if ((pFile->iSize - pFile->iPos) < iLen)
-    iBytesRead = pFile->iSize - pFile->iPos - 1; // Ugly work-around
-  if (iBytesRead <= 0) return 0; // EOF/error, return 0 bytes read
-  iBytesRead = (int32_t)f->read(pBuf, iBytesRead); // Do the read
-  pFile->iPos = f->position(); // Update file position
-  return iBytesRead; // Return number of bytes actually read
-}
-
-/**
- * @brief Seek to position in GIF file
- *
- * Seeks to the specified position in the GIF file, which was previously
- * opened via GIFOpenFile(). The function updates the file position
- * in the GIFFILE object and returns the new position.
- *
- * @param pFile    Pointer to GIF file object
- * @param iPosition Desired new position in file
- *
- * @return Actual new position in file
- */
-int32_t GIFSeekFile(GIFFILE *pFile, int32_t iPosition) {
-  // Seek to position in GIF file and update file position
-  File *f = static_cast<File *>(pFile->fHandle);
-  f->seek(iPosition);
-  pFile->iPos = (int32_t)f->position();
-  // Return new file position
-  return pFile->iPos;
-}
-
-// Draw one line of image to matrix back buffer
-void GIFDraw(GIFDRAW *pDraw) {
-  uint8_t *s;
-  uint16_t *d, *usPalette, usTemp[320];
-  int x, y, i;
-  float scale_x = (float)pDraw->iWidth / matrix.width();
-  float scale_y = (float)pDraw->iHeight / matrix.height();
-
-  y = pDraw->iY + pDraw->y; // current line in image
-
-  // Vertical clip
-  int16_t screenY = yPos + y; // current row on matrix
-  if ((screenY < 0) || (screenY >= matrix.height())) return;
-
-  usPalette = pDraw->pPalette;
-
-  s = pDraw->pPixels;
-
-  // Escalar imagen
-  // for (y = 0; y < matrix.height(); y++) {
-  //     for (x = 0; x < matrix.width(); x++) {
-  //         i = (int)(y * scale_y) * pDraw->iWidth + (int)(x * scale_x);
-  //         usTemp[y * matrix.width() + x] = usPalette[pDraw->pPixels[i]];
-  //     }
-  // }
-
-
-  // Apply the new pixels to the main image
-  if (pDraw->ucHasTransparency) { // if transparency used
-    uint8_t *pEnd, c, ucTransparent = pDraw->ucTransparent;
-    int x, iCount;
-    pEnd = s + pDraw->iWidth;
-    x = 0;
-    iCount = 0; // count non-transparent pixels
-    while (x < pDraw->iWidth) {
-      c = ucTransparent - 1;
-      d = usTemp;
-      while (c != ucTransparent && s < pEnd) {
-        c = *s++;
-        if (c == ucTransparent) { // done, stop
-          s--;                    // back up to treat it like transparent
-        } else {                  // opaque
-          *d++ = usPalette[c];
-          iCount++;
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) break; // no hay más archivos
+    if (!entry.isDirectory()) {
+      char filename[256];
+      entry.getName(filename, sizeof(filename) - 1);
+      // Ignoramos archivos que empiecen con "._" (basura de Mac) y revisamos la extensión
+      if (strncmp(filename, "._", 2) != 0) {
+        char *extension = strrchr(filename, '.');
+        if (extension && !strcasecmp(&extension[1], "GIF")) {
+          list.push_back(String("/") + String(path) + "/" + String(filename));
         }
-      }             // while looking for opaque pixels
-      if (iCount) { // any opaque pixels?
-        span(usTemp, xPos + pDraw->iX + x, screenY, iCount);
-        x += iCount;
-        iCount = 0;
-      }
-      // no, look for a run of transparent pixels
-      c = ucTransparent;
-      while (c == ucTransparent && s < pEnd) {
-        c = *s++;
-        if (c == ucTransparent)
-          iCount++;
-        else
-          s--;
-      }
-      if (iCount) {
-        x += iCount; // skip these
-        iCount = 0;
       }
     }
-  } else {
-    s = pDraw->pPixels;
-    // Translate 8-bit pixels through RGB565 palette (already byte reversed)
-    for (x = 0; x < pDraw->iWidth; x++)
-      usTemp[x] = usPalette[*s++];
-    span(usTemp, xPos + pDraw->iX, screenY, pDraw->iWidth);
+    entry.close();
   }
+  dir.close();
+
+  Serial.print("Encontrados ");
+  Serial.print(list.size());
+  Serial.println(" GIF(s).");
 }
 
-// Copy a horizontal span of pixels from a source buffer to an X,Y position
-// in matrix back buffer, applying horizontal clipping. Vertical clipping is
-// handled in GIFDraw() above -- y can safely be assumed valid here.
-void span(uint16_t *src, int16_t x, int16_t y, int16_t width) {
-  if (x >= matrix.width()) return; // Span entirely off right of matrix
-  int16_t x2 = x + width - 1;      // Rightmost pixel
-  if (x2 < 0) return;              // Span entirely off left of matrix
-  if (x < 0) {                     // Span partially off left of matrix
-    width += x;                    // Decrease span width
-    src -= x;                      // Increment source pointer to new start
-    x = 0;                         // Leftmost pixel is first column
+// ---------- 2) GifPlayer: manejo de la librería AnimatedGIF ---
+class GifPlayer {
+public:
+  AnimatedGIF   gif;       // Objeto de la librería
+  File          gifFile;   // Archivo abierto
+  bool          isOpen;    // Indica si hay un GIF abierto
+  uint32_t      lastFrameTime;  // Para control no bloqueante
+  int32_t       nextFrameDelay; // ms a esperar para siguiente frame
+  int16_t       xPos, yPos;     // Para centrar
+  int           currentCycle;   // Cuántas repeticiones se han completado
+  bool          cycleCounted;   // Evitar contar el mismo ciclo varias veces
+
+  GifPlayer() : isOpen(false), lastFrameTime(0), nextFrameDelay(0),
+                xPos(0), yPos(0), currentCycle(0), cycleCounted(false) {}
+
+  // Funciones requeridas por AnimatedGIF
+  static void * openCallback(const char *filename, int32_t *pSize) {
+    Serial.print("GIFOpenFile: ");
+    Serial.println(filename);
+    GifPlayer *player = &instance(); // Instancia singleton
+    player->gifFile = filesys.open(filename);
+    if (!player->gifFile) {
+      Serial.println("Error abriendo archivo");
+      return NULL;
+    }
+    *pSize = player->gifFile.size();
+    return (void *)&player->gifFile;
   }
-  if (x2 >= matrix.width()) {      // Span partially off right of matrix
-    width -= (x2 - matrix.width() + 1);
-  }
-  if(matrix.getRotation() == 0) {
-    memcpy(matrix.getBuffer() + y * matrix.width() + x, src, width * 2);
-  } else {
-    while(x <= x2) {
-      // TODO: Ver si puedo incorporar esto
-      //  matrix.drawPixel(msg.x, msg.y, msg.state * MAX_BRIGHTNESS);
-      matrix.drawPixel(x++, y, *src++);
+
+  static void closeCallback(void *pHandle) {
+    File *f = static_cast<File *>(pHandle);
+    if (f) {
+      f->close();
     }
   }
+
+  static int32_t readCallback(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen) {
+    File *f = static_cast<File *>(pFile->fHandle);
+    if (!f) return 0;
+    if ((pFile->iSize - pFile->iPos) < iLen) {
+      iLen = pFile->iSize - pFile->iPos;
+    }
+    int32_t bytesRead = f->read(pBuf, iLen);
+    pFile->iPos = f->position();
+    return bytesRead;
+  }
+
+  static int32_t seekCallback(GIFFILE *pFile, int32_t iPosition) {
+    File *f = static_cast<File *>(pFile->fHandle);
+    if (!f) return -1;
+    f->seek(iPosition);
+    pFile->iPos = f->position();
+    return pFile->iPos;
+  }
+
+  static void drawCallback(GIFDRAW *pDraw) {
+    GifPlayer &player = instance();
+    int16_t screenY = player.yPos + pDraw->iY + pDraw->y;
+    if (screenY < 0 || screenY >= matrix.height()) return;
+
+    uint8_t  *s = pDraw->pPixels;
+    uint16_t *usPalette = pDraw->pPalette;
+    uint16_t tempLine[320];
+
+    if (pDraw->ucHasTransparency) {
+      uint8_t ucTransparent = pDraw->ucTransparent;
+      uint8_t *pEnd = s + pDraw->iWidth;
+      int x = 0;
+      while (x < pDraw->iWidth) {
+        int count = 0;
+        while ((s < pEnd) && (*s != ucTransparent)) {
+          tempLine[count++] = usPalette[*s++];
+        }
+        if (count) {
+          memcpy(matrix.getBuffer() + screenY * matrix.width() + player.xPos + pDraw->iX + x,
+                 tempLine, count * 2);
+          x += count;
+        }
+        count = 0;
+        while ((s < pEnd) && (*s == ucTransparent)) {
+          s++;
+          count++;
+        }
+        x += count;
+      }
+    } else {
+      for (int x = 0; x < pDraw->iWidth; x++) {
+        tempLine[x] = usPalette[*s++];
+      }
+      memcpy(matrix.getBuffer() + screenY * matrix.width() + player.xPos + pDraw->iX,
+             tempLine, pDraw->iWidth * 2);
+    }
+  }
+
+  // Inicializar la librería (llamar en setup)
+  void begin() {
+    gif.begin(LITTLE_ENDIAN_PIXELS);
+  }
+
+  // Abrir un GIF dado su nombre
+  bool openGif(const char *filename) {
+    closeGif();
+    isOpen = gif.open(filename, openCallback, closeCallback,
+                      readCallback, seekCallback, drawCallback);
+    if (!isOpen) {
+      Serial.println("Fallo abriendo el GIF");
+      return false;
+    }
+    xPos = (matrix.width()  - gif.getCanvasWidth())  / 2;
+    yPos = (matrix.height() - gif.getCanvasHeight()) / 2;
+    currentCycle   = 0;
+    cycleCounted   = false;
+    lastFrameTime  = millis();
+    nextFrameDelay = 0;
+    // Limpiamos la pantalla al abrir el GIF
+    matrix.fillScreen(0);
+    matrix.show();
+    return true;
+  }
+
+  // Cerrar el GIF y limpiar la pantalla
+  void closeGif() {
+    if (isOpen) {
+      gif.close();
+      isOpen = false;
+      gifFile.close();
+      matrix.fillScreen(0);
+      matrix.show();
+    }
+  }
+
+  // Reproducir el frame actual (no bloqueante)
+  bool playFrame() {
+    if (!isOpen) return false;
+
+    unsigned long now = millis();
+    if ((long)(now - lastFrameTime) >= nextFrameDelay) {
+      nextFrameDelay = gif.playFrame(true, NULL);
+      // Aplica un factor de ralentización (ajusta según tu preferencia)
+      nextFrameDelay *= 3;  
+      matrix.show();
+      lastFrameTime = now;
+
+      if (nextFrameDelay < 0) {
+        return false;
+      }
+
+      if (gifFile && gifFile.position() < 10 && !cycleCounted) {
+        currentCycle++;
+        cycleCounted = true;
+        Serial.print("Ciclo completo: ");
+        Serial.println(currentCycle);
+      } else if (gifFile && gifFile.position() >= 10) {
+        cycleCounted = false;
+      }
+
+      if (currentCycle >= GIF_CYCLES) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static GifPlayer &instance() {
+    static GifPlayer single;
+    return single;
+  }
+};
+
+// ---------- 3) UI: Mostrar texto animado "Compu LAB" ------------
+void showAnimatedText() {
+  // Limpia la pantalla
+  matrix.fillScreen(0);
+  matrix.show();
+  
+  // Color Pipboy: verde brillante (RGB565)
+  uint16_t pipColor = 0x07E0;
+  
+  // Dibuja un borde doble para el efecto Pipboy
+  for (int i = 0; i < 2; i++) {
+    matrix.drawRect(i, i, matrix.width() - 2 * i, matrix.height() - 2 * i, pipColor);
+  }
+  
+  // Configura el tamaño y el color del texto
+  matrix.setTextSize(2);
+  matrix.setTextColor(pipColor);
+  
+  // Texto a mostrar
+  const char *line1 = "Compu";
+  const char *line2 = "LAB";
+  
+  // Calcula el ancho aproximado de cada línea (el ancho de cada carácter es ~6px a tamaño 1, 12px a tamaño 2)
+  int compuWidth = 5 * 12; // Aproximadamente 60px para "Compu"
+  int labWidth   = 3 * 12; // Aproximadamente 36px para "LAB"
+  
+  // Calcula la posición final para centrar cada línea
+  int targetXCompu = (matrix.width() - compuWidth) / 2;
+  int targetXLab   = (matrix.width() - labWidth) / 2;
+  
+  // Altura de línea (aprox. 16px para tamaño 2)
+  int lineHeight = 16;
+  // Calcula las posiciones verticales (se puede ajustar para un look más dinámico)
+  int yCompu = (matrix.height() - (lineHeight * 2)) / 2 - 2;
+  int yLab   = yCompu + lineHeight;
+  
+  // Valor inicial para la animación (comenzamos fuera de pantalla a la izquierda)
+  float startX = -matrix.width();
+  
+  // Efecto "slide in": interpolamos un parámetro t de 0 a 1
+  for (float t = 0.0; t <= 1.0; t += 0.05) {
+    int currentXCompu = startX * (1.0 - t) + targetXCompu * t;
+    int currentXLab   = startX * (1.0 - t) + targetXLab * t;
+    
+    matrix.fillScreen(0);
+    // Redibuja el borde
+    for (int i = 0; i < 2; i++) {
+      matrix.drawRect(i, i, matrix.width() - 2 * i, matrix.height() - 2 * i, pipColor);
+    }
+    // Dibuja el texto en su posición actual
+    matrix.setCursor(currentXCompu, yCompu);
+    matrix.print(line1);
+    matrix.setCursor(currentXLab, yLab);
+    matrix.print(line2);
+    matrix.show();
+    delay(30);
+  }
+  
+  // Mantén el mensaje final centrado durante 5 segundos
+  unsigned long holdTime = millis();
+  while (millis() - holdTime < 5000) {
+    matrix.show();
+    delay(100);
+  }
+  
+  // Limpia la pantalla al finalizar
+  matrix.fillScreen(0);
+  matrix.show();
 }
 
-// FUNCTIONS REQUIRED FOR USB MASS STORAGE ---------------------------------
 
-static bool msc_changed = true; // Is set true on filesystem changes
 
-// Callback on READ10 command.
+
+// --------------- VARIABLES GLOBALES PARA EL LOOP ---------------
+GifPlayer &gifPlayer = GifPlayer::instance();
+int16_t gifIndex = -1;        // Índice actual en gifList
+int8_t  gifIncrement = 1;     // Dirección (+1 = siguiente, -1 = anterior)
+
+// --------------- CALLBACKS MSC (mass storage) ---------------
 int32_t msc_read_cb(uint32_t lba, void *buffer, uint32_t bufsize) {
   return flash.readBlocks(lba, (uint8_t *)buffer, bufsize / 512) ? bufsize : -1;
 }
-
-// Callback on WRITE10 command.
 int32_t msc_write_cb(uint32_t lba, uint8_t *buffer, uint32_t bufsize) {
   digitalWrite(LED_BUILTIN, HIGH);
   return flash.writeBlocks(lba, buffer, bufsize / 512) ? bufsize : -1;
 }
-
-// Callback on WRITE10 completion.
 void msc_flush_cb(void) {
-  flash.syncBlocks();   // Sync with flash
-  filesys.cacheClear(); // Clear filesystem cache to force refresh
+  flash.syncBlocks();
+  filesys.cacheClear();
   digitalWrite(LED_BUILTIN, LOW);
   msc_changed = true;
 }
 
-// Get number of files in a specified path that match extension ('filter').
-// Pass in absolute path (e.g. "/" or "/gifs") and extension WITHOUT period
-// (e.g. "gif", NOT ".gif").
-int16_t numFiles(const char *path, const char *filter) {
-  File dir = filesys.open(path);
-  if (!dir) return -1;
-  char filename[256];
-  for(int16_t num_files = 0;;) {
-    File entry = dir.openNextFile();
-    if (!entry) return num_files; // No more files
-    entry.getName(filename, sizeof(filename) - 1);
-    entry.close();
-    if (!entry.isDirectory() &&       // Skip directories
-        strncmp(filename, "._", 2)) { // and Mac junk files
-      char *extension = strrchr(filename, '.');
-      if (extension && !strcasecmp(&extension[1], filter)) num_files++;
-    }
-  }
-  return -1;
-}
-
-// Return name of file (matching extension) by index (0 to numFiles()-1)
-char *filenameByIndex(const char *path, const char *filter, int16_t index) {
-  static char filename[256]; // Must be static, we return a pointer to this!
-  File entry, dir = filesys.open(path);
-  if (!dir) return NULL;
-  while(entry = dir.openNextFile()) {
-    entry.getName(filename, sizeof(filename) - 1);
-    entry.close();
-    if(!entry.isDirectory() &&       // Skip directories
-       strncmp(filename, "._", 2)) { // and Mac junk files
-      char *extension = strrchr(filename, '.');
-      if (extension  && !strcasecmp(&extension[1], filter)) {
-        if(!index--) {
-          return filename;
-        }
-      }
-    }
-  }
-  return NULL;
-}
-
-// SETUP FUNCTION - RUNS ONCE AT STARTUP -----------------------------------
-
+// ========================== SETUP ===========================
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
 #if defined(BACK_BUTTON)
@@ -376,118 +383,88 @@ void setup() {
   pinMode(NEXT_BUTTON, INPUT_PULLUP);
 #endif
 
-  // USB mass storage / filesystem setup (do BEFORE Serial init)
   flash.begin();
-  // Set disk vendor id, product id and revision
   usb_msc.setID("Adafruit", "External Flash", "1.0");
-  // Set disk size, block size is 512 regardless of spi flash page size
   usb_msc.setCapacity(flash.pageSize() * flash.numPages() / 512, 512);
   usb_msc.setReadWriteCallback(msc_read_cb, msc_write_cb, msc_flush_cb);
-  usb_msc.setUnitReady(true); // MSC is ready for read/write
+  usb_msc.setUnitReady(true);
   usb_msc.begin();
-  filesys.begin(&flash); // Start filesystem on the flash
+  filesys.begin(&flash);
 
   Serial.begin(115200);
-  //while (!Serial);
+  // while(!Serial);
 
-  // Protomatter (RGB matrix) setup
   ProtomatterStatus status = matrix.begin();
-  Serial.print("Protomatter begin() status: ");
+  Serial.print("Protomatter status: ");
   Serial.println((int)status);
   matrix.fillScreen(0);
   matrix.show();
 
-  // GIF setup
-  GIF.begin(LITTLE_ENDIAN_PIXELS);
+  gifPlayer.begin();
+
+  scanGifs(GIF_DIR, gifList);
+
+  gifIndex = -1;
+  gifIncrement = 1;
 }
 
-// LOOP FUNCTION - RUNS REPEATEDLY UNTIL RESET / POWER OFF -----------------
-
-int16_t GIFindex = -1;     // Current file index in GIFpath
-int8_t GIFincrement = 1;   // +1 = next GIF, -1 = prev, 0 = same
-uint32_t GIFstartTime = 0; // When current GIF started playing
-bool GIFisOpen = false;    // True if GIF is currently open
-
+// =========================== LOOP ===========================
 void loop() {
-  if (msc_changed) {     // If filesystem has changed...
-    msc_changed = false; // Clear flag
-    GIFincrement = 1;
-    // unsigned long currentMillis = millis();
-
-    // TODO: Esto aparentemente tampoco hace nada
-    // delay(5000); 
-
-    // TODO: Esto no esta funcionando, el sleep para sensores
-    // if (currentMillis - previousMillis >= interval) {
-    //   previousMillis = currentMillis;   // Guarda el tiempo de ahora como referencia para la próxima vez.
-    //   // Coloca aquí el código que quieres ejecutar cada 5 segundos.
-    //   Serial.println("5 segundos han pasado");
-    // }
-    return;              // Prioritize USB, handled in calling func
+  if (msc_changed) {
+    msc_changed = false;
+    scanGifs(GIF_DIR, gifList);
+    gifIncrement = 1;
+    return;
   }
 
 #if defined(BACK_BUTTON)
-  if(!digitalRead(BACK_BUTTON)) {
-    GIFincrement = -1;                // Back
-    while(!digitalRead(BACK_BUTTON)); // Wait for release
+  if (!digitalRead(BACK_BUTTON)) {
+    gifIncrement = -1;
+    while(!digitalRead(BACK_BUTTON));
   }
 #endif
 #if defined(NEXT_BUTTON)
-  if(!digitalRead(NEXT_BUTTON)) {
-    GIFincrement = 1;                 // Forward
-    while(!digitalRead(NEXT_BUTTON)); // Wait for release
+  if (!digitalRead(NEXT_BUTTON)) {
+    gifIncrement = 1;
+    while(!digitalRead(NEXT_BUTTON));
   }
 #endif
 
-  if (GIFincrement) { // Change file?
-    Serial.printf("Se incrementa");
-    if (GIFisOpen) {  // If currently playing,
-      Serial.printf("Cerrando fichero");
-      GIF.close();    // stop it
-      GIFisOpen = false;
+  if (gifIncrement != 0) {
+    if (gifPlayer.isOpen) {
+      gifPlayer.closeGif();
     }
-    GIFindex += GIFincrement; // Fwd or back 1 file
-    int num_files = numFiles(GIFpath, "GIF");
-    if(GIFindex >= num_files) GIFindex = 0;         // 'Wrap around' file index
-    else if(GIFindex < 0) GIFindex = num_files - 1; // both directions
+    // Limpiar la pantalla antes de abrir un nuevo GIF
+    matrix.fillScreen(0);
+    matrix.show();
 
-    char *filename = filenameByIndex(GIFpath, "GIF", GIFindex);
-    if (filename) {
-      char fullname[sizeof GIFpath + 256];
-      sprintf(fullname, "%s/%s", GIFpath, filename); // Absolute path to GIF
-      Serial.printf("Opening file '%s'\n", fullname);
-      if (GIF.open(fullname, GIFOpenFile, GIFCloseFile,
-                   GIFReadFile, GIFSeekFile, GIFDraw)) {
-        assert(GIF.getCanvasWidth() != 0); // Check for null pointer reference
-        assert(GIF.getCanvasHeight() != 0);
-        matrix.fillScreen(0);
-        Serial.printf("GIF dimensions Dani 2: %d x %d\n",
-                      GIF.getCanvasWidth(), GIF.getCanvasHeight());
-        Serial.printf("Matrix dimensions: %d x %d\n",
-                      matrix.width(), matrix.height());
-        xPos = (matrix.width() - GIF.getCanvasWidth()) / 2; // Center on matrix
-        yPos = (matrix.height() - GIF.getCanvasHeight()) / 2;
-        GIFisOpen = true;
-        GIFstartTime = millis();
-        GIFincrement = 0; // Reset increment flag
-      } else {
-        Serial.printf("Error loading file");
-      }
-    }
-  } else if(GIFisOpen) {
-    if (GIF.playFrame(true, NULL) >= 0) { // Auto resets to start if needed
-      assert(GIF.getCanvasWidth() != 0);
-      assert(GIF.getCanvasHeight() != 0);
-      // TODO: No tengo claro que esto este funcionando
-      // delay(33);  // Establece un retardo para aproximadamente 30 FPS
-      // yield();    // Permite procesos en segundo plano
+    if (gifList.empty()) {
+      matrix.fillScreen(0);
       matrix.show();
-      if ((millis() - GIFstartTime) >= (GIFminimumTime * 1000)) {
-        GIFincrement = 1; // Minimum time has elapsed, proceed to next GIF
+      return;
+    }
+
+    gifIndex += gifIncrement;
+    if (gifIndex >= (int)gifList.size()) {
+      showAnimatedText();
+      gifIndex = 0;
+    } else if (gifIndex < 0) {
+      gifIndex = gifList.size() - 1;
+    }
+    Serial.print("Abriendo: ");
+    Serial.println(gifList[gifIndex]);
+
+    if (gifPlayer.openGif(gifList[gifIndex].c_str())) {
+      Serial.println("GIF abierto correctamente");
+    }
+    gifIncrement = 0;
+  }
+  else {
+    if (gifPlayer.isOpen) {
+      bool playing = gifPlayer.playFrame();
+      if (!playing) {
+        gifIncrement = 1;
       }
-    } else {
-      GIFincrement = 1; // Decode error, proceed to next GIF
     }
   }
 }
-
